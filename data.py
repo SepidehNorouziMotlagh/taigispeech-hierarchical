@@ -1,4 +1,5 @@
 from collections import Counter
+import statistics
 
 import torch
 from datasets import Audio, load_dataset
@@ -9,6 +10,10 @@ from utils import set_seed
 
 BACKBONE_NAME = "microsoft/wavlm-base-plus"
 SAMPLE_RATE = 16000
+
+# --- NEW: cap audio length to avoid OOM on long outliers ---
+MAX_AUDIO_SECONDS = 15
+MAX_AUDIO_LEN = MAX_AUDIO_SECONDS * SAMPLE_RATE
 
 EMERGENCY_INTENTS = {
     "SOS_CALL",
@@ -57,6 +62,10 @@ class TaigiDataset(Dataset):
         audio = item["audio"]["array"]
         sr = item["audio"]["sampling_rate"]
         assert sr == SAMPLE_RATE, f"expected {SAMPLE_RATE}, got {sr}"
+
+        # --- NEW: truncate overly long clips to prevent OOM ---
+        if len(audio) > MAX_AUDIO_LEN:
+            audio = audio[:MAX_AUDIO_LEN]
 
         inputs = self.feature_extractor(
             audio, sampling_rate=sr, return_tensors="pt"
@@ -127,6 +136,16 @@ if __name__ == "__main__":
         binary = sum(counts.get(k, 0) for k in EMERGENCY_INTENTS)
         print(f"{split} emergency={binary}, non-emergency={sum(counts.values()) - binary}")
         print(f"{split} per-intent: {counts}")
+
+    # --- NEW: audio length diagnostic ---
+    for split in ["train", "val", "test"]:
+        lengths = [len(ds[split][i]["audio"]["array"]) / SAMPLE_RATE
+                   for i in range(len(ds[split]))]
+        n_over = sum(1 for L in lengths if L > MAX_AUDIO_SECONDS)
+        print(f"{split} audio len: min={min(lengths):.2f}s "
+              f"median={statistics.median(lengths):.2f}s "
+              f"max={max(lengths):.2f}s | "
+              f"over {MAX_AUDIO_SECONDS}s: {n_over}/{len(lengths)}")
 
     feature_extractor = AutoFeatureExtractor.from_pretrained(BACKBONE_NAME)
     item = ds["train"][0]
