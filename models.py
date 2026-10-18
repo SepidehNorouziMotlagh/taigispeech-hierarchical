@@ -38,7 +38,7 @@ def build_model_b(
     )
 
     lora_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,
+        task_type=None,
         r=r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
