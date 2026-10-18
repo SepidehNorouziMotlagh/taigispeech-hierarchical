@@ -2,15 +2,18 @@
 """
 Training utilities for TaigiSpeech intent classification.
 
-The training loop selects the best model using validation macro-F1.
-Whenever that score improves, it saves the model's state_dict locally
-and, when a W&B run is active, logs a versioned model artifact.
+The training loop selects the best checkpoint using validation macro-F1.
+Whenever validation macro-F1 improves, model weights are saved locally
+and optionally uploaded to Weights & Biases as a versioned artifact.
 
-Checkpoint files contain model weights only. They are intended for
-evaluation and inference, not exact resumption of optimizer state.
+Supports:
+    Condition A: Full fine-tuning.
+    Condition B: LoRA fine-tuning.
+
+Checkpoint files contain model state_dict weights only. They do not
+contain optimizer or scheduler state and cannot resume training exactly.
 """
 
-import os
 import time
 from pathlib import Path
 
@@ -23,8 +26,9 @@ from transformers import get_linear_schedule_with_warmup
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, device):
-    """Train for one epoch and return the sample-weighted mean loss."""
+    """Train for one epoch and return sample-weighted mean loss."""
     model.train()
+
     total_loss = 0.0
     n_samples = 0
 
@@ -42,7 +46,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, device):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad],
+            max_norm=1.0,
+        )
+
         optimizer.step()
 
         if scheduler is not None:
@@ -60,11 +69,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, device):
 
 @torch.no_grad()
 def evaluate(model, loader, device, emergency_indices):
-    """Evaluate intent classification and binary emergency detection."""
+    """Evaluate 8-class intent classification and binary emergency detection."""
     model.eval()
+
     predictions_all = []
     labels_all = []
     emergency_all = []
+
     total_loss = 0.0
     n_samples = 0
     emergency_set = set(emergency_indices)
@@ -104,10 +115,15 @@ def evaluate(model, loader, device, emergency_indices):
         "loss": total_loss / n_samples,
         "accuracy": accuracy_score(labels, predictions),
         "macro_f1": f1_score(
-            labels, predictions, average="macro", zero_division=0
+            labels,
+            predictions,
+            average="macro",
+            zero_division=0,
         ),
         "emergency_recall": recall_score(
-            emergency_labels, predicted_emergency, zero_division=0
+            emergency_labels,
+            predicted_emergency,
+            zero_division=0,
         ),
         "emergency_f1": f1_score(
             emergency_labels,
@@ -125,26 +141,19 @@ def save_best_checkpoint(
     artifact_name="taigispeech-condition-a",
     epoch_index=None,
     metrics=None,
+    condition_name="A",
+    artifact_description=None,
 ):
     """
-    Save model weights locally and optionally log a W&B model artifact.
+    Save the model's state_dict locally and optionally upload a W&B artifact.
 
-    Local saving happens first, so a W&B upload problem does not prevent
-    the best checkpoint from being saved in the current runtime.
-
-    Args:
-        model: Trained PyTorch model.
-        checkpoint_path: Destination path for the local state_dict.
-        wandb_run: Active W&B run, or None to disable artifact logging.
-        artifact_name: Stable W&B artifact name; improvements create
-            successive versions under this name.
-        epoch_index: Zero-based epoch index, as used internally.
-        metrics: Validation metrics associated with this checkpoint.
+    The local checkpoint is saved before attempting an artifact upload.
+    Artifact metadata identifies the condition and validation metrics.
     """
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save weights first. This remains available even if cloud upload fails.
+    # Save local weights first so they survive an upload failure.
     torch.save(model.state_dict(), checkpoint_path)
     print(f"[checkpoint] Saved local weights: {checkpoint_path}")
 
@@ -155,7 +164,7 @@ def save_best_checkpoint(
     human_epoch = epoch_index + 1 if epoch_index is not None else None
 
     metadata = {
-        "condition": "A",
+        "condition": condition_name,
         "checkpoint_format": "pytorch_state_dict",
         "epoch_index_zero_based": epoch_index,
         "epoch_number_one_based": human_epoch,
@@ -167,24 +176,30 @@ def save_best_checkpoint(
         "val_emergency_f1": metrics.get("emergency_f1"),
     }
 
+    description = artifact_description or (
+        f"Best validation-macro-F1 checkpoint for "
+        f"TaigiSpeech Condition {condition_name}."
+    )
+
     try:
         artifact = wandb.Artifact(
             name=artifact_name,
             type="model",
-            description=(
-                "Best validation-macro-F1 checkpoint for "
-                "TaigiSpeech Condition A: full WavLM fine-tuning."
-            ),
+            description=description,
             metadata=metadata,
         )
-        artifact.add_file(str(checkpoint_path), name="A_best.pt")
+
+        artifact.add_file(
+            str(checkpoint_path),
+            name=checkpoint_path.name,
+        )
 
         logged_artifact = wandb_run.log_artifact(
             artifact,
             aliases=["best", "latest"],
         )
 
-        # Wait for the upload to finish before training continues.
+        # Wait for the upload to finish before continuing.
         logged_artifact.wait()
 
         print(
@@ -194,8 +209,7 @@ def save_best_checkpoint(
         )
 
     except Exception as exc:
-        # Do not discard a successful local save because the network,
-        # W&B service, or artifact upload failed.
+        # A network or W&B error must not invalidate the local checkpoint.
         print(
             "[checkpoint] WARNING: W&B artifact upload failed. "
             f"The local checkpoint remains at {checkpoint_path}. "
@@ -217,34 +231,66 @@ def train(
     ckpt_path="checkpoints/A_best.pt",
     wandb_run=None,
     artifact_name="taigispeech-condition-a",
+    condition_name="A",
+    artifact_description=None,
 ):
     """
-    Train a model with early stopping and best-checkpoint tracking.
+    Train with early stopping and validation-macro-F1 checkpoint selection.
 
-    The model is selected using validation macro-F1. Every improvement
-    triggers a local checkpoint save and, if enabled, a W&B artifact
-    upload. Epoch indices in W&B metrics are zero-based; artifact
-    metadata also stores the corresponding one-based epoch number.
+    Defaults preserve compatibility with the original Condition A runner.
+    Condition B can pass its own condition name, checkpoint and artifact.
     """
     if epochs < 1:
         raise ValueError("epochs must be at least 1.")
+
+    if lr <= 0:
+        raise ValueError("lr must be positive.")
+
+    if weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative.")
+
     if not 0.0 <= warmup_ratio <= 1.0:
         raise ValueError("warmup_ratio must be between 0 and 1.")
+
     if patience < 1:
         raise ValueError("patience must be at least 1.")
+
     if len(train_loader) == 0:
         raise ValueError("The training loader contains no batches.")
+
     if len(val_loader) == 0:
         raise ValueError("The validation loader contains no batches.")
 
     model = model.to(device)
+
+    # For full fine-tuning, this includes all trainable model parameters.
+    # For LoRA, frozen backbone parameters are excluded automatically.
+    trainable_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+
+    if not trainable_parameters:
+        raise ValueError("The model has no trainable parameters.")
+
+    trainable_count = sum(p.numel() for p in trainable_parameters)
+    total_count = sum(p.numel() for p in model.parameters())
+
+    print(
+        f"[model] Trainable parameters: {trainable_count:,} / "
+        f"{total_count:,} "
+        f"({100.0 * trainable_count / total_count:.2f}%)"
+    )
+
     optimizer = AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=lr,
         weight_decay=weight_decay,
     )
 
     total_steps = len(train_loader) * epochs
+
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * warmup_ratio),
@@ -252,7 +298,8 @@ def train(
     )
 
     print(
-        f"[train] total_steps={total_steps} | "
+        f"[train] condition={condition_name} | "
+        f"total_steps={total_steps} | "
         f"batches/epoch={len(train_loader)} | "
         f"epochs={epochs} | patience={patience}"
     )
@@ -265,12 +312,21 @@ def train(
         epoch_start = time.time()
 
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scheduler, device
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            device,
         )
         train_seconds = time.time() - epoch_start
 
         validation_start = time.time()
-        val = evaluate(model, val_loader, device, emergency_indices)
+        val = evaluate(
+            model,
+            val_loader,
+            device,
+            emergency_indices,
+        )
         validation_seconds = time.time() - validation_start
 
         improved = val["macro_f1"] > best_f1
@@ -287,6 +343,8 @@ def train(
                 artifact_name=artifact_name,
                 epoch_index=epoch,
                 metrics=val,
+                condition_name=condition_name,
+                artifact_description=artifact_description,
             )
         else:
             no_improve += 1
@@ -298,7 +356,8 @@ def train(
             f"val_acc={val['accuracy']:.4f} | "
             f"val_macro_f1={val['macro_f1']:.4f} | "
             f"val_emg_recall={val['emergency_recall']:.4f} | "
-            f"train_t={train_seconds:.1f}s "
+            f"val_emg_f1={val['emergency_f1']:.4f} | "
+            f"train_t={train_seconds:.1f}s | "
             f"val_t={validation_seconds:.1f}s"
             + (" *NEW BEST*" if improved else "")
         )
@@ -328,9 +387,8 @@ def train(
             break
 
     print(
-        f"Best epoch: {best_epoch + 1} | "
+        f"[train] Best epoch: {best_epoch + 1} | "
         f"best val macro-F1: {best_f1:.4f}"
     )
 
     return best_epoch, best_f1
-
