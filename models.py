@@ -218,7 +218,7 @@ def enable_wavlm_lora_attention(model):
 
 def build_model_b(
     num_labels=8,
-    lora_r=8,
+    r=8,
     lora_alpha=16,
     lora_dropout=0.0,
 ):
@@ -245,7 +245,7 @@ def build_model_b(
 
     lora_config = LoraConfig(
         task_type=None,
-        r=lora_r,
+        r=r,
         lora_alpha=lora_alpha,
         lora_dropout=0.0,
         target_modules=["q_proj", "v_proj"],
