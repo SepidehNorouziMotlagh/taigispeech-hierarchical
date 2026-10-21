@@ -263,6 +263,23 @@ def build_model_b(
 
     return model
 
+def count_parameters(model):
+    """
+    Return total and trainable parameter counts.
+    """
+    total = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+    return total, trainable
+
 
 # ---------------------------------------------------------------------
 # Quick local verification
