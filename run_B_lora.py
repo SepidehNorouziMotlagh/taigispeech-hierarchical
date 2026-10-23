@@ -1,201 +1,292 @@
+"""Condition B: LoRA-adapted WavLM-base-plus (backbone frozen).
 
-"""Run Condition B: LoRA fine-tuning for TaigiSpeech."""
+Same 8-class task, same training protocol, same lr and epoch budget as
+Condition A. The only variable is the adaptation method: full fine-tuning
+vs. LoRA. This tests whether parameter-efficient adaptation matches full
+fine-tuning on a small speech dataset (~1,600 training samples).
+
+Reference point: Condition A achieved 0.8332 val macro-F1 with 94.6M
+trainable parameters. The question for B is whether ~0.5M trainable
+parameters can reach a similar macro-F1.
+
+Usage (from the project root; run on a Colab T4 for full training):
+
+    # Full converged run, checkpoint + config persisted to Google Drive
+    python run_B_lora.py --epochs 20 --save_config \\
+        --ckpt /content/drive/MyDrive/taigispeech/checkpoints/B_best.pt
+
+    # Quick smoke test (CPU ok; a few minutes on CPU)
+    python run_B_lora.py --epochs 1 --limit_train 16 --limit_val 32 --no_wandb
+
+LoRA hyperparameters are loaded from ``configs/lora_config.yaml`` and can be
+overridden on the command line (e.g. ``--lora_r 16``).
+
+The saved checkpoint is the LoRA adapter + classification head only
+(~2-10 MB), not the 380 MB base backbone. It is meant to be published to
+Hugging Face Hub in Phase 8.
+"""
 
 import argparse
-from pathlib import Path
+import json
+import os
 
-import wandb
+import yaml
 from torch.utils.data import DataLoader, Subset
+import wandb
 
-from data import EMERGENCY_INTENTS, build_datasets, collate_fn
-from models import BACKBONE_NAME, build_model_b, count_parameters
+from data import build_datasets, collate_fn, EMERGENCY_INTENTS
+from models import build_model_b
 from train import train
 from utils import get_device, set_seed
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train the TaigiSpeech Condition B LoRA model."
+def default_run_name(args: argparse.Namespace, lora_r: int) -> str:
+    """Auto-generate a W&B run name from condition + hyperparameters.
+
+    Format: B_<mode>_r<rank>_lr<lr>_ep<epochs>_bs<batch_size>
+
+    ``mode`` is "smoke" when either --limit_train or --limit_val is set.
+
+    Examples:
+        B_full_r8_lr3e-05_ep20_bs8   (converged LoRA baseline)
+        B_full_r16_lr3e-05_ep20_bs8  (rank-override experiment)
+        B_smoke_r8_lr3e-05_ep1_bs8   (16-sample smoke test)
+
+    ``lora_r`` must be the RESOLVED rank (post-YAML, post-CLI-override),
+    not ``args.lora_r`` — the CLI value may be None.
+    """
+    mode = (
+        "smoke"
+        if (args.limit_train is not None or args.limit_val is not None)
+        else "full"
     )
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--limit_train", type=int, default=None)
-    parser.add_argument("--limit_val", type=int, default=None)
-    parser.add_argument("--no_wandb", action="store_true")
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default="checkpoints/B_best.pt",
+    return (
+        f"B_{mode}_r{lora_r}_lr{args.lr:.0e}"
+        f"_ep{args.epochs}_bs{args.batch_size}"
     )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default="B_lora",
-    )
-    parser.add_argument(
-        "--artifact_name",
-        type=str,
-        default="taigispeech-condition-b",
-    )
-    parser.add_argument(
-        "--wandb_project",
-        type=str,
-        default="taigispeech-hierarchical",
-    )
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--lora_dropout", type=float, default=0.1)
-    return parser.parse_args()
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Condition B: LoRA-adapted WavLM-base-plus (backbone frozen).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=20,
+        help="Training epochs. Condition A peaked at epoch 17 of 20.",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=8,
+        help="Per-step batch size. 8 fits a T4 with 15 s audio.",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=3e-5,
+        help="Learning rate. Matches Condition A for fair comparison. "
+             "LoRA sometimes benefits from 1e-4; treat this as the "
+             "controlled baseline.",
+    )
+    parser.add_argument(
+        "--limit_train", type=int, default=None,
+        help="If set, use only the first N train samples (smoke tests).",
+    )
+    parser.add_argument(
+        "--limit_val", type=int, default=None,
+        help="If set, use only the first N val samples (smoke tests).",
+    )
+    parser.add_argument(
+        "--no_wandb", action="store_true",
+        help="Disable W&B logging (use for smoke tests).",
+    )
+    parser.add_argument(
+        "--ckpt", type=str, default="checkpoints/B_best.pt",
+        help="Path for the best checkpoint. Point at Google Drive for "
+             "persistence across Colab sessions.",
+    )
+    parser.add_argument(
+        "--save_config", action="store_true",
+        help="Write a JSON config alongside the checkpoint.",
+    )
+    parser.add_argument(
+        "--run_name", type=str, default=None,
+        help="Override the auto-generated W&B run name.",
+    )
+    parser.add_argument(
+        "--lora_config", type=str, default="configs/lora_config.yaml",
+        help="Path to the LoRA YAML config.",
+    )
+    parser.add_argument(
+        "--lora_r", type=int, default=None,
+        help="Override LoRA rank from the YAML config.",
+    )
+    args = parser.parse_args()
 
-    if args.lora_r < 1:
-        raise ValueError("--lora_r must be at least 1.")
-    if args.batch_size < 1:
-        raise ValueError("--batch_size must be at least 1.")
+    # ------------------------------------------------------------------
+    # Resolve LoRA config BEFORE generating the run name, so the name
+    # shows the actual rank rather than "None".
+    # ------------------------------------------------------------------
+    with open(args.lora_config) as f:
+        lora_cfg = yaml.safe_load(f)
 
-    seed = 42
-    set_seed(seed)
+    lora_r = args.lora_r if args.lora_r is not None else lora_cfg["rank"]
+    lora_alpha = lora_cfg["alpha"]
+    lora_dropout = lora_cfg["dropout"]
+    target_modules = lora_cfg["target_modules"]
 
+    set_seed(42)
     device = get_device()
+    run_name = args.run_name or default_run_name(args, lora_r)
     print(f"Device: {device}")
+    print(f"Run name: {run_name}")
+    print(
+        f"LoRA: r={lora_r} alpha={lora_alpha} dropout={lora_dropout} "
+        f"targets={target_modules}"
+    )
 
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
     splits, label_names, label2id = build_datasets()
     emergency_indices = sorted(
-        label2id[name]
-        for name in EMERGENCY_INTENTS
-        if name in label2id
+        label2id[n] for n in EMERGENCY_INTENTS if n in label2id
     )
-
     print(f"Labels: {label_names}")
-    print(f"Emergency IDs: {emergency_indices}")
-    print(
-        f"Official split sizes: train={len(splits['train'])}, "
-        f"val={len(splits['val'])}, test={len(splits['test'])}"
-    )
+    print(f"Emergency ids: {emergency_indices}")
 
-    # Only train and validation are used during model selection.
-    # The official test split remains untouched.
     train_ds = splits["train"]
-    val_ds = splits["val"]
-
     if args.limit_train is not None:
         train_ds = Subset(
-            train_ds,
-            list(range(min(args.limit_train, len(train_ds)))),
+            train_ds, list(range(min(args.limit_train, len(train_ds))))
         )
-        print(f"Limited training set: {len(train_ds)} samples")
+        print(f"Smoke test: train limited to {len(train_ds)} samples")
 
+    val_ds = splits["val"]
     if args.limit_val is not None:
         val_ds = Subset(
-            val_ds,
-            list(range(min(args.limit_val, len(val_ds)))),
+            val_ds, list(range(min(args.limit_val, len(val_ds))))
         )
-        print(f"Limited validation set: {len(val_ds)} samples")
-
-    if len(train_ds) == 0 or len(val_ds) == 0:
-        raise ValueError("Training and validation datasets must be nonempty.")
+        print(f"Smoke test: val limited to {len(val_ds)} samples")
 
     train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=0,
     )
     val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=0,
+    )
+    print(
+        f"train batches/epoch: {len(train_loader)} | "
+        f"val batches/epoch: {len(val_loader)}"
     )
 
+    # ------------------------------------------------------------------
+    # Model — WavLM + LoRA (backbone frozen, adapters + head trainable)
+    # ------------------------------------------------------------------
     model = build_model_b(
         num_labels=len(label_names),
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
     )
 
-    parameter_stats = count_parameters(model)
-
-    print("\nLoRA model parameter summary")
-    print(f"Total parameters: {parameter_stats['total_parameters']:,}")
+    # Trainable-parameter count is the LoRA diagnostic. With the fixes
+    # above this should be roughly 0.4-0.6% of the backbone. If it shows
+    # 100%, the backbone was not frozen (PEFT wrapper missing).
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
-        "Trainable parameters: "
-        f"{parameter_stats['trainable_parameters']:,}"
-    )
-    print(
-        "Trainable percentage: "
-        f"{parameter_stats['trainable_percentage']:.2f}%"
+        f"[model] Trainable parameters: {trainable:,} / {total:,} "
+        f"({100 * trainable / total:.2f}%)"
     )
 
-    # PEFT provides a second useful trainability summary.
-    model.print_trainable_parameters()
-
+    # ------------------------------------------------------------------
+    # W&B logging
+    # ------------------------------------------------------------------
     wandb_run = None
     if not args.no_wandb:
         wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=args.run_name,
+            project="taigispeech-hierarchical",
+            name=run_name,
             config={
                 "condition": "B",
-                "backbone": BACKBONE_NAME,
-                "method": "LoRA",
-                "target_modules": ["q_proj", "v_proj"],
-                "lora_r": args.lora_r,
-                "lora_alpha": args.lora_alpha,
-                "lora_dropout": args.lora_dropout,
-                "modules_to_save": ["projector", "classifier"],
-                "learning_rate": args.lr,
+                "backbone": "microsoft/wavlm-base-plus",
+                "lora_r": lora_r,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "lora_target_modules": target_modules,
+                "trainable_params": trainable,
+                "total_params": total,
+                "lr": args.lr,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
-                "seed": seed,
-                "selection_metric": "validation_macro_f1",
-                **parameter_stats,
+                "run_name": run_name,
             },
         )
 
-    checkpoint_path = Path(args.ckpt)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Checkpoint directory and config snapshot
+    # ------------------------------------------------------------------
+    ckpt_dir = os.path.dirname(args.ckpt)
+    if ckpt_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-    try:
-        best_epoch, best_f1 = train(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            emergency_indices=emergency_indices,
-            epochs=args.epochs,
-            lr=args.lr,
-            ckpt_path=str(checkpoint_path),
-            wandb_run=wandb_run,
-            artifact_name=args.artifact_name,
-            condition_name="B",
-            artifact_description=(
-                "Best validation-macro-F1 checkpoint for TaigiSpeech "
-                "Condition B: WavLM-base-plus with LoRA attention "
-                "adapters and a trainable intent-classification head."
-            ),
-        )
+    config_path = (
+        args.ckpt.replace(".pt", "_config.json") if args.save_config else None
+    )
+    config_snapshot = {
+        "condition": "B",
+        "run_name": run_name,
+        "backbone": "microsoft/wavlm-base-plus",
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_target_modules": target_modules,
+        "trainable_params": trainable,
+        "total_params": total,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "limit_train": args.limit_train,
+        "limit_val": args.limit_val,
+        "max_audio_seconds": 15,
+        "label_names": label_names,
+        "emergency_indices": emergency_indices,
+    }
 
-        if wandb_run is not None:
-            wandb_run.summary["best_val_macro_f1"] = best_f1
-            wandb_run.summary["best_epoch_index_zero_based"] = best_epoch
-            wandb_run.summary["best_epoch_number_one_based"] = best_epoch + 1
-            wandb_run.summary["checkpoint_path"] = str(checkpoint_path)
+    # Written pre-training so hyperparameters are on disk even if the
+    # process is killed mid-run.
+    if config_path is not None:
+        with open(config_path, "w") as f:
+            json.dump(config_snapshot, f, indent=2)
+        print(f"Config (pre-training) written to: {config_path}")
 
-        print(f"\nBest validation macro-F1: {best_f1:.4f}")
-        print(f"Best epoch: {best_epoch + 1}")
-        print(f"Checkpoint: {checkpoint_path.resolve()}")
+    # ------------------------------------------------------------------
+    # Train
+    # ------------------------------------------------------------------
+    best_epoch, best_f1 = train(
+        model, train_loader, val_loader, device,
+        emergency_indices,
+        epochs=args.epochs,
+        lr=args.lr,
+        ckpt_path=args.ckpt,
+        wandb_run=wandb_run,
+    )
 
-    finally:
-        if wandb_run is not None:
-            wandb_run.finish()
+    # ------------------------------------------------------------------
+    # Post-training: enrich config, finalize W&B
+    # ------------------------------------------------------------------
+    if config_path is not None:
+        config_snapshot["best_epoch"] = best_epoch
+        config_snapshot["best_val_macro_f1"] = float(best_f1)
+        with open(config_path, "w") as f:
+            json.dump(config_snapshot, f, indent=2)
+        print(f"Config (post-training) updated: {config_path}")
+
+    if wandb_run is not None:
+        wandb_run.summary["best_val_macro_f1"] = best_f1
+        wandb_run.summary["best_epoch"] = best_epoch
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
