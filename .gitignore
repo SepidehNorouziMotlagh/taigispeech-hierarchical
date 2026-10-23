@@ -8,3 +8,6 @@ checkpoints/
 *.ckpt
 .env
 .DS_Store
+*.docx
+Condition A*.txt
+writing-block.md
