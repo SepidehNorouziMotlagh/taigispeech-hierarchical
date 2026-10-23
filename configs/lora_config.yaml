@@ -1,0 +1,25 @@
+# LoRA configuration for Condition B (and reused for C, D, E).
+# Values follow the standard recommendation for parameter-efficient
+# fine-tuning of transformer speech models on small datasets.
+
+backbone: microsoft/wavlm-base-plus
+
+# Low-rank adapter dimensions
+rank: 8              # r in the LoRA paper; 8 was sufficient at r/alpha=32
+alpha: 32            # effective scale = alpha / r = 4.0
+dropout: 0.05        # dropout on the LoRA branch during training
+
+# Attention projection layers to adapt.
+# WavLM uses BERT-style names (q_proj, v_proj, k_proj, out_proj).
+# q_proj and v_proj are the standard minimum; k_proj and out_proj can
+# be added if rank=8 is insufficient.
+target_modules:
+  - q_proj
+  - v_proj
+
+# Notes:
+#   - Full fine-tuning (Condition A) used 94,580,856 trainable params.
+#   - LoRA at rank=8 targets ~1-2M trainable params (~1-2% of backbone).
+#   - If Condition B underperforms Condition A by > 3 macro-F1 points,
+#     try rank=16 or add k_proj/out_proj before concluding LoRA is
+#     insufficient for this task.
